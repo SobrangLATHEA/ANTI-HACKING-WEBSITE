@@ -1,0 +1,162 @@
+npm install express helmet express-rate-limit bcrypt dotenv cookie-session uuid
+PORT=3000
+SESSION_SECRET=replace_with_a_long_random_string
+PASS_HASH=$2b$12$
+// quick script (node): create-hash.js
+const bcrypt = require('bcrypt');
+const pass = 'your-strong-passphrase';
+bcrypt.hash(pass, 12).then(h => console.log(h));
+{
+  "a1": { "label":"Instagram", "desc":"Photos", "url":"https://instagram.com/yourusername" },
+  "b2": { "label":"Twitter/X", "desc":"Short posts", "url":"https://twitter.com/yourusername" },
+  "c3": { "label":"LinkedIn", "desc":"Professional", "url":"https://www.linkedin.com/in/yourname" }
+}
+// server.js
+require('dotenv').config();
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcrypt');
+const fs = require('fs').promises;
+const path = require('path');
+const cookieSession = require('cookie-session');
+const { v4: uuidv4 } = require('uuid');
+
+const PORT = process.env.PORT || 3000;
+const PASS_HASH = process.env.PASS_HASH; // bcrypt hash
+const SESSION_SECRET = process.env.SESSION_SECRET || 'change_this';
+
+const app = express();
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"]
+    }
+  }
+}));
+
+// Very strict referrer policy: NO referrer for outbound links
+app.use((req, res, next) => {
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // limit each IP to 30 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(limiter);
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+app.use(cookieSession({
+  name: 'sess',
+  keys: [SESSION_SECRET],
+  maxAge: 15 * 60 * 1000, // 15 minutes
+  httpOnly: true,
+  secure: true, // requires HTTPS in production
+  sameSite: 'lax'
+}));
+
+// Serve static SPA
+app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html' }));
+
+// Simple helper: load links
+async function loadLinks() {
+  const content = await fs.readFile(path.join(__dirname, 'links.json'), 'utf8');
+  return JSON.parse(content);
+}
+
+// AUTH: login route - POST { pass }
+app.post('/login', async (req, res) => {
+  const pass = (req.body && req.body.pass) ? String(req.body.pass) : '';
+  if (!PASS_HASH) return res.status(500).json({ ok: false, err: 'server misconfigured' });
+
+  try {
+    const ok = await bcrypt.compare(pass, PASS_HASH);
+    if (!ok) return res.status(401).json({ ok: false, err: 'unauthorized' });
+
+    // create a small session id
+    req.session.uid = uuidv4();
+    req.session.auth = true;
+    // shorten session lifetime behavior: set timestamp
+    req.session.createdAt = Date.now();
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, err: 'error' });
+  }
+});
+
+// LOGOUT
+app.post('/logout', (req, res) => {
+  req.session = null;
+  res.json({ ok: true });
+});
+
+// Middleware to check auth
+function requireAuth(req, res, next) {
+  if (req.session && req.session.auth) return next();
+  return res.status(401).json({ ok: false, err: 'not_authorized' });
+}
+
+// Return only labels + ids (no raw urls)
+app.get('/api/links', requireAuth, async (req, res) => {
+  try {
+    const links = await loadLinks();
+    // map to id/label/desc
+    const out = Object.entries(links).map(([id, v]) => ({
+      id,
+      label: v.label,
+      desc: v.desc || ''
+    }));
+    res.json({ ok: true, links: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, err: 'server_error' });
+  }
+});
+
+// Server-side redirect/proxy to real URL
+// This endpoint is used by the client to go to the real site.
+// Using a redirect avoids leaking raw URL in client code, but note referrer and headers are controlled via headers above.
+app.get('/p/:id', requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const links = await loadLinks();
+    if (!links[id]) return res.status(404).send('Not found');
+
+    const target = links[id].url;
+    // Option 1: redirect (fast)
+    // Use 302 and set no-referrer already above; use rel="noopener" on client when opening
+    return res.redirect(302, target);
+
+    // Option 2: server-side fetch and stream back (more privacy but heavier)
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('Server error');
+  }
+});
+
+// Simple health check
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// catch-all: serve SPA index.html (for client-side routing)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => console.log(`Private vault server listening on port ${PORT}`));
